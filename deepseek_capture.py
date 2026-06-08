@@ -290,22 +290,18 @@ def find_answer(before, after, question=""):
             deduped.append(c)
 
     answer = "\n".join(deduped)
-    return answer if len(answer) >= 30 else None
+    return answer if len(answer) >= 40 else None
 
 
 # ── Reference extraction (DeepSeek-specific) ───────────────────
 
 def extract_search_info(texts):
-    """Extract web search references from DeepSeek's UI.
+    """Extract web search summary and ref count from visible text.
 
     DeepSeek shows inline citations like [citation:1] and a "N 个网页"
-    button that opens a reference panel. The panel contains entries in
-    this pattern: source_name → date(YYYY/MM/DD) → index_number → title → description
+    button that opens a reference panel with source details.
     """
     search_summary = ""
-    sources = []
-
-    # Find "N 个网页" label (could be "已阅读 N 个网页" or "N 个网页")
     for t in texts:
         m = re.search(r'(\d+)\s*个网页', t)
         if m:
@@ -313,106 +309,128 @@ def extract_search_info(texts):
             break
 
     total_refs = 0
-    # Count unique citations from answer text
     all_citations = re.findall(r'\[citation:(\d+)\]', ' '.join(texts))
     if all_citations:
         total_refs = max(int(c) for c in all_citations)
 
-    # Log reference detection
-    for t in texts:
-        if '个网页' in t:
-            print(f"  [*] Reference: {t}")
-            break
+    return search_summary, total_refs
 
-    # Open reference panel and parse entries
-    try:
+
+def capture_refs_with_urls(answer_text="", use_frida=False):
+    """Extract citation references from answer text + capture URLs via Frida.
+
+    DeepSeek uses inline [citation:N] markers. We parse citations from the
+    answer, then (if Frida) scroll to find and click each citation link
+    to trigger WebView loading for URL capture.
+
+    Returns (sources, captured_urls).
+    """
+    sources = []
+    captured_urls = []
+
+    # Extract unique citation numbers from answer
+    citations = set()
+    for m in re.finditer(r'\[citation:(\d+)\]', answer_text):
+        citations.add(int(m.group(1)))
+
+    if not citations:
+        return sources, captured_urls
+
+    # Build source list
+    for c in sorted(citations):
+        sources.append({
+            "index": c,
+            "title": "",
+            "sitename": "",
+            "url": "",
+            "summary": "",
+            "date": "",
+        })
+
+    print(f"  [*] {len(sources)} citations found in answer")
+
+    if not use_frida:
+        return sources, captured_urls
+
+    # Click citation badges in answer body to trigger WebView.
+    # Panel approach is unreliable (crashes DeepSeek).
+    d = _get_d()
+    baseline = _read_frida_output()
+
+    for src in sources:
+        idx = src["index"]
+
         d = _get_d()
-        ref_btn = None
-        for t in texts:
-            if '个网页' in t:
-                ref_btn = d(text=t)
+        badge_found = False
+
+        # Search for this badge. Citations appear top→bottom in answer text.
+        # We scan down from current position — citation order maps to text order.
+        for scroll_step in range(50):
+            d = _get_d()
+            # Citation badge: text="N" + content-desc="引用 N"
+            el = d(description=f"引用 {idx}")
+            if not el.exists:
+                el = d(text=str(idx))
+            if el.exists:
+                for ei in range(min(el.count, 30)):
+                    try:
+                        info = el[ei].info
+                        top = info.get('bounds', {}).get('top', 0)
+                        if 200 < top < 2800:
+                            bounds = info.get('bounds', {})
+                            cx = (bounds.get('left', 0) + bounds.get('right', 0)) // 2
+                            cy = (bounds.get('top', 0) + bounds.get('bottom', 0)) // 2
+                            _adb_tap(cx, cy)
+                            time.sleep(3)
+
+                            new_output = _read_frida_output()
+                            new_urls = _parse_new_urls(baseline, new_output)
+                            url = new_urls[0] if new_urls else ""
+                            captured_urls.append(url)
+                            baseline = new_output
+                            badge_found = True
+                            print(f"    [{idx}] {'URL ✓' if url else 'no URL'}")
+                            break
+                    except Exception:
+                        continue
+            if badge_found:
                 break
-        if not ref_btn or not ref_btn.exists:
-            # Try content-desc
-            ref_btn = d(textMatches=r".*个网页.*")
-
-        if ref_btn and ref_btn.exists:
-            print(f"  [*] Opening reference panel...")
-            ref_btn.click()
-            time.sleep(2)
-
-            d2 = _get_d()
-            raw = d2.dump_hierarchy()
-            panel_lines = raw.split('\n')
-
-            # Extract text items from panel (com.deepseek elements only)
-            panel_items = []
-            for line in panel_lines:
-                if 'com.deepseek' not in line:
-                    continue
-                text_m = re.search(r'text="([^"]*)"', line)
-                desc_m = re.search(r'content-desc="([^"]*)"', line)
-                t = _html.unescape(text_m.group(1) if text_m else '').strip()
-                dsc = _html.unescape(desc_m.group(1) if desc_m else '').strip()
-                item = t if t else dsc
-                if item and item not in panel_items:
-                    panel_items.append(item)
-
-            # Parse entries: date(YYYY/MM/DD) followed by index number
-            # Pattern: ..., source_name, date, index, title, description, source_name, date, ...
-            i = 0
-            while i < len(panel_items):
-                item = panel_items[i]
-                # Look for index number followed by date pattern
-                # Entry starts 2 items before the index number
-                if (re.match(r'^\d+$', item)
-                        and i >= 2
-                        and re.match(r'^\d{4}/\d{2}/\d{2}$', panel_items[i - 1])):
-
-                    num = int(item)
-                    date_str = panel_items[i - 1]
-                    src_name = panel_items[i - 2]
-
-                    # Title comes after the index number
-                    title = ""
-                    if i + 1 < len(panel_items):
-                        title = panel_items[i + 1]
-
-                    # Description comes after title
-                    desc = ""
-                    if i + 2 < len(panel_items):
-                        desc = panel_items[i + 2]
-                        # If desc looks like a date (next entry's date), it's not a desc
-                        if re.match(r'^\d{4}/\d{2}/\d{2}$', desc) or re.match(r'^\d+$', desc):
-                            desc = ""
-
-                    # Skip if source_name looks like a date or index
-                    if not re.match(r'^\d{4}/\d{2}/\d{2}$', src_name) and not re.match(r'^\d+$', src_name):
-                        sources.append({
-                            "index": num,
-                            "title": title if len(title) > 1 else "",
-                            "sitename": src_name if len(src_name) > 1 else "",
-                            "url": "",
-                            "summary": desc if len(desc) > 5 else "",
-                            "date": date_str,
-                        })
-                    i += 3
-                i += 1
-
-            # Close reference panel
-            close = d2(description="关闭")
-            if close.exists:
-                close.click()
+            # First 25 steps: scroll down. Last 25: scroll up (badge may be above)
+            if scroll_step < 25:
+                _adb_swipe(540, 2200, 540, 400, 200)
             else:
-                subprocess.run([ADB, "-s", DEVICE, "shell", "input", "keyevent", "4"],
-                               capture_output=True)
-            time.sleep(0.5)
-            print(f"  [*] {len(sources)} references extracted from panel")
+                _adb_swipe(540, 400, 540, 2200, 200)
+            time.sleep(0.2)
 
-    except Exception:
-        pass
+        if badge_found:
+            # Back from WebView, wait for chat restore
+            subprocess.run([ADB, "-s", DEVICE, "shell", "input", "keyevent", "4"],
+                           capture_output=True)
+            time.sleep(3)
+            _ensure_unlocked()
+            global _d
+            _d = None  # Fresh u2 connection
+        else:
+            captured_urls.append("")
+            print(f"    [{idx}] badge not found")
 
-    return search_summary, total_refs if total_refs else len(sources), sources
+    # Fill source info from URL domains
+    for i, src in enumerate(sources):
+        if i < len(captured_urls) and captured_urls[i]:
+            src["url"] = captured_urls[i]
+            if not src.get("sitename"):
+                src["sitename"] = _parse_sitename_from_url(captured_urls[i])
+        # Extract title from answer text: find sentence containing [citation:N]
+        if not src.get("title"):
+            pattern = rf'([^。.!！\n]{{5,80}}\[citation:{src["index"]}\][^。.!！\n]{{0,30}})'
+            m = re.search(pattern, answer_text)
+            if m:
+                src["title"] = m.group(1).strip()
+
+    print(f"  [*] {sum(1 for u in captured_urls if u)}/{len(captured_urls)} URLs captured")
+
+
+    return sources, captured_urls
 
 
 # ── Domain → sitename mapping ──────────────────────────────────
@@ -634,103 +652,45 @@ def send_message(text):
 # ── Response detection ─────────────────────────────────────────
 
 def wait_for_response(before, timeout=TIMEOUT, question=""):
-    """Wait for AI response. DeepSeek returns multi-node answers."""
+    """Wait for AI response. Returns (answer, search_summary, total_refs)."""
     search_summary = ""
     total_refs = 0
-    sources = []
 
     for i in range(timeout):
         time.sleep(1)
 
-        # Periodically check if response is still generating
-        if i > 0 and i % 10 == 0:
-            pass  # DeepSeek renders progressively; no scroll needed
-
         after = get_texts()
 
-        # Check for search summary early
-        s, tr, src = extract_search_info(after)
+        # Check for search summary
+        s, tr = extract_search_info(after)
         if s and not search_summary:
-            search_summary, total_refs, sources = s, tr, src
+            search_summary, total_refs = s, tr
 
         ans = find_answer(before, after, question=question)
         if ans:
             if not search_summary:
-                s, tr, src = extract_search_info(after)
+                s, tr = extract_search_info(after)
                 if s:
-                    search_summary, total_refs, sources = s, tr, src
-            # Wait a bit more for the response to fully generate
-            for _ in range(5):
-                time.sleep(1)
+                    search_summary, total_refs = s, tr
+            # DeepSeek streams progressively — wait + scroll to capture full answer
+            no_growth = 0
+            for _ in range(25):
+                time.sleep(2)
                 after2 = get_texts()
                 ans2 = find_answer(before, after2, question=question)
                 if ans2 and len(ans2) > len(ans):
                     ans = ans2
-            return ans, search_summary, total_refs, sources
+                    no_growth = 0
+                else:
+                    no_growth += 1
+                    if no_growth >= 4:  # 4 checks (8s) with no growth = done
+                        break
+            return ans, search_summary, total_refs
 
         if i % 10 == 0 and i > 0:
             print(f"    ... {i}s")
 
-    return None, "", 0, []
-
-
-# ── Frida URL capture for DeepSeek ────────────────────────────
-
-def _capture_urls(source_count):
-    """Click each reference in the panel and capture URLs via Frida."""
-    sources_with_urls = []
-    d = _get_d()
-
-    # Open reference panel
-    ref_btn = d(textMatches=r".*个网页.*")
-    if not ref_btn or not ref_btn.exists:
-        print("  [!] No reference panel found")
-        return []
-
-    ref_btn.click()
-    time.sleep(2)
-
-    baseline = _read_frida_output()
-    d2 = _get_d()
-
-    # Find clickable reference items in the panel
-    for i in range(1, source_count + 1):
-        ref_el = d2(text=str(i))
-        if not ref_el.exists:
-            # Try clicking the title next to the number
-            continue
-
-        try:
-            ref_el.click()
-            time.sleep(2.5)
-
-            new_output = _read_frida_output()
-            new_urls = _parse_new_urls(baseline, new_output)
-            url = new_urls[0] if new_urls else ""
-            baseline = new_output
-
-            sources_with_urls.append(url)
-            print(f"  [{i - 1}] {'URL ✓' if url else 'no URL'}")
-
-            # Back to reference panel
-            subprocess.run([ADB, "-s", DEVICE, "shell", "input", "keyevent", "4"],
-                           capture_output=True)
-            time.sleep(1.5)
-            d2 = _get_d()
-
-        except Exception as e:
-            sources_with_urls.append("")
-            print(f"  [{i - 1}] Error: {e}")
-
-    # Close reference panel
-    close = d2(description="关闭")
-    if close.exists:
-        close.click()
-    else:
-        subprocess.run([ADB, "-s", DEVICE, "shell", "input", "keyevent", "4"],
-                       capture_output=True)
-
-    return sources_with_urls
+    return None, "", 0
 
 
 # ── Save output ────────────────────────────────────────────────
@@ -830,11 +790,10 @@ def main():
             print(f"\n{'─' * 50}")
             print(answer[:500])
             print(f"{'─' * 50}\n")
-            search_summary, total_refs, sources = extract_search_info(texts)
-            captured_urls = []
-            if use_frida and sources:
-                print(f"[*] Capturing URLs for {len(sources)} references...")
-                captured_urls = _capture_urls(len(sources))
+            sources, captured_urls = capture_refs_with_urls(
+                answer_text=answer, use_frida=use_frida)
+            search_summary, _ = extract_search_info(texts)
+            total_refs = len(sources) if sources else 0
             save("(manual)", answer, out, search_summary, total_refs,
                  sources, captured_urls, think_mode=think_mode)
             print("Done ✓")
@@ -869,48 +828,57 @@ def main():
         print("[1/5] Restart app (clean state)...")
         restart_app()
 
-    print("[2/5] Select model + snapshot...")
+    print("[2/5] Select model + new conversation...")
     _select_model(think_mode)
-    before = set(get_texts())
+    # Tap "使用X模式开始对话" to enter chat, or use "开启新对话"
+    d = _get_d()
+    start_text = d(text="使用快速模式开始对话") if think_mode == "quick" else d(text="使用专家模式开始对话")
+    if start_text.exists:
+        start_text.click()
+        time.sleep(2)
+    else:
+        _start_new_conversation()
+        time.sleep(1)
+    # Verify we're in a chat (EditText should be visible or activatable)
+    d = _get_d()
+    if not d(className="android.widget.EditText").exists:
+        # Try bottom tap to activate input
+        _adb_tap(720, 2760)
+        time.sleep(1)
 
-    print("[3/5] New conversation + send...")
-    _start_new_conversation()
-    time.sleep(0.5)
+    print("[3/5] Snapshot + send...")
+    before = set(get_texts())
     send_message(msg)
 
     step = "6" if use_frida else "5"
     print(f"[5/{step}] Wait for AI reply...")
-    answer, search_summary, total_refs, sources = wait_for_response(
+    answer, search_summary, total_refs = wait_for_response(
         before, question=msg
     )
 
     if answer:
-        # Post-response: wait for reference button to render, then extract
-        if not search_summary or not sources:
-            time.sleep(3)
-            s2, tr2, src2 = extract_search_info(get_texts())
-            if s2:
-                search_summary = s2
-                total_refs = tr2 if tr2 else total_refs
-                sources = src2 if src2 else sources
-        print(f"  [*] Refs: {len(sources)} sources, summary=\"{search_summary}\"")
-
         print(f"\n{'─' * 50}")
         print(answer[:500])
         if len(answer) > 500:
             print(f"... ({len(answer)} chars total)")
         print(f"{'─' * 50}\n")
 
-        captured_urls = []
-        if use_frida and sources:
-            print(f"[6/{step}] Capture URLs for {len(sources)} references...")
-            captured_urls = _capture_urls(len(sources))
-            captured = len([u for u in captured_urls if u])
-            print(f"  Captured {captured}/{len(sources)} URLs")
+        # Extract references + URLs in one combined step
+        print(f"[6/{step}] Extract references + capture URLs...")
+        time.sleep(2)  # Wait for reference button to fully render
+        sources, captured_urls = capture_refs_with_urls(
+            answer_text=answer, use_frida=use_frida)
 
-        final_step = "7" if (use_frida and sources) else step
+        captured = len([u for u in captured_urls if u])
+        print(f"  Result: {len(sources)} sources, {captured}/{len(sources)} URLs")
+        if not search_summary:
+            search_summary2, _ = extract_search_info(get_texts())
+            if search_summary2:
+                search_summary = search_summary2
+
+        final_step = "7" if use_frida else "6"
         print(f"[{final_step}/{final_step}] Save JSON...")
-        save(msg, answer, out, search_summary, total_refs,
+        save(msg, answer, out, search_summary, total_refs if total_refs else len(sources),
              sources, captured_urls, think_mode=think_mode)
         print("Done ✓")
     else:
