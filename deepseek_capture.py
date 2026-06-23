@@ -53,11 +53,11 @@ def _start_frida():
     subprocess.run(["pkill", "-9", "-f", "frida.*deepseek"], capture_output=True)
     time.sleep(0.5)
     subprocess.run([ADB, "-s", DEVICE, "shell",
-                    "su", "-c", "killall frida-server-17.9.11-android-arm64 2>/dev/null; true"],
+                    "su", "-c", "killall frida-server-17 2>/dev/null; true"],
                    capture_output=True)
     time.sleep(0.5)
     subprocess.run([ADB, "-s", DEVICE, "shell",
-                    "su", "-c", "nohup /data/local/tmp/frida-server-17.9.11-android-arm64 &"],
+                    "su", "-c", "nohup /data/local/tmp/frida-server-17 &"],
                    capture_output=True)
     time.sleep(1.5)
 
